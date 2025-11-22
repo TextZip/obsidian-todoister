@@ -20,15 +20,12 @@ import {
 } from "obsidian";
 import { createQueryClient } from "./lib/create-query-client.ts";
 import { obsidianFetchAdapter } from "./lib/obsidian-fetch-adapter.ts";
-import {
-	type ParseResults,
-	parseFileContent,
-} from "./lib/parse-file-content.ts";
-import { replaceTasksInContent } from "./lib/replace-tasks-in-content.ts";
+import { type ParseResults, parseContent } from "./lib/parse-content.ts";
 import { TodoisterSettingTab } from "./lib/settings-tab.ts";
 import { convertTodoistToObsidian } from "./lib/task/convert-todoist-to-obsidian.ts";
 import { isObsidianId } from "./lib/task/is-obsidian-id.ts";
 import type { ObsidianTask } from "./lib/task/obsidian-task.ts";
+import { obsidianTaskStringify } from "./lib/task/obsidian-task-stringify.ts";
 import { tasksEquals } from "./lib/task/tasks-equals.ts";
 
 interface PluginData {
@@ -153,7 +150,7 @@ export default class TodoisterPlugin extends Plugin {
 		const activeFile = this.app.workspace.getActiveFile();
 
 		if (activeFile) {
-			await this.#onFileOpen(activeFile);
+			this.#onFileOpen(activeFile);
 		}
 	}
 
@@ -237,7 +234,9 @@ export default class TodoisterPlugin extends Plugin {
 		return true;
 	}
 
-	#pluginIsEnabled(file: TFile): boolean {
+	#pluginIsEnabled(file: TFile | null): file is TFile {
+		if (!file) return false;
+
 		return (
 			this.app.metadataCache.getFileCache(file)?.frontmatter?.[
 				"todoist-sync"
@@ -303,24 +302,28 @@ export default class TodoisterPlugin extends Plugin {
 					projectId: this.#data.todoistProjectId,
 				});
 			},
-			onSuccess: async (todoistTask) => {
+			onSuccess: (todoistTask) => {
 				const file = this.app.workspace.getActiveFile();
+				const editor = this.app.workspace.activeEditor?.editor;
 
-				if (file && todoistTask) {
-					const content = await this.app.vault.read(file);
+				if (!this.#pluginIsEnabled(file)) return;
+				if (!editor) return;
 
-					if (content.includes(task.id)) {
-						const updatedContent = content.replace(task.id, todoistTask.id);
+				const content = editor.getValue();
+				const offset = content.indexOf(task.id);
 
-						await this.app.vault.modify(file, updatedContent);
+				if (offset !== -1) {
+					const from = editor.offsetToPos(offset);
+					const to = editor.offsetToPos(offset + task.id.length);
 
-						this.#addToActiveFileCache(
-							todoistTask.id,
-							this.#createTodoistCacheEntry(
-								convertTodoistToObsidian(todoistTask),
-							),
-						);
-					}
+					editor.replaceRange(todoistTask.id, from, to);
+
+					this.#addToActiveFileCache(
+						todoistTask.id,
+						this.#createTodoistCacheEntry(
+							convertTodoistToObsidian(todoistTask),
+						),
+					);
 				}
 
 				this.#deleteFromActiveFileCache(task.id);
@@ -423,53 +426,50 @@ export default class TodoisterPlugin extends Plugin {
 		};
 	}
 
-	#onFileOpen = async (file: TFile | null) => {
-		if (!file || !this.#pluginIsEnabled(file)) {
+	#onFileOpen = (file: TFile | null) => {
+		if (!this.#pluginIsEnabled(file)) {
 			this.#clearActiveFileCache();
 			return;
 		}
 
-		const content = await this.app.vault.read(file);
+		const editor = this.app.workspace.activeEditor?.editor;
 
-		const parseResults = parseFileContent(content);
+		if (!editor) return;
+
+		const parseResults = parseContent(editor.getValue());
 
 		this.#updateActiveFileCache(parseResults);
 
 		const newTasks = parseResults.filter(({ isNew }) => isNew);
 
-		if (newTasks.length) {
-			this.app.vault.modify(file, replaceTasksInContent(content, newTasks));
+		for (const { task, from, to } of newTasks) {
+			editor.replaceRange(obsidianTaskStringify(task), from, to);
 		}
 	};
 
-	#onEditorChange = async (editor: Editor, view: MarkdownView) => {
-		const file = view.file;
+	#onEditorChange = (editor: Editor, view: MarkdownView) => {
+		if (!this.#pluginIsEnabled(view.file)) return;
 
 		const content = editor.getValue();
 
-		if (!file) return;
-		if (!this.#pluginIsEnabled(file)) return;
-
 		clearTimeout(this.#timeout);
 
-		this.#timeout = setTimeout(async () => {
+		this.#timeout = setTimeout(() => {
 			this.#timeout = undefined;
 
-			console.log(content);
-
-			const parseResults = parseFileContent(content);
+			const parseResults = parseContent(content);
 
 			const newTasks = parseResults.filter(({ isNew }) => isNew);
 
-			if (newTasks.length) {
-				this.app.vault.modify(file, replaceTasksInContent(content, newTasks));
+			for (const { task, from, to } of newTasks) {
+				editor.replaceRange(obsidianTaskStringify(task), from, to);
 			}
 
 			this.#updateActiveFileCache(parseResults);
 		}, 1000);
 	};
 
-	#onQueryUpdate = async ({
+	#onQueryUpdate = ({
 		data: todoistTask,
 		status,
 	}: QueryObserverResult<Task>) => {
@@ -479,26 +479,22 @@ export default class TodoisterPlugin extends Plugin {
 
 		if (cacheEntry?.updatedAt) return;
 
-		const file = this.app.workspace.getActiveFile();
+		const editor = this.app.workspace.activeEditor?.editor;
 
-		if (!file) return;
+		if (!editor) return;
 
-		const updatedTask = convertTodoistToObsidian(todoistTask);
-		const content = await this.app.vault.read(file);
+		const updatedTask = obsidianTaskStringify(
+			convertTodoistToObsidian(todoistTask),
+		);
 
-		const changes = parseFileContent(content)
-			.filter(
-				({ task }) =>
-					task.id === todoistTask.id && !tasksEquals(task, todoistTask),
-			)
-			.map(({ lineNumber }) => ({
-				lineNumber,
-				task: updatedTask,
-			}));
+		const changes = parseContent(editor.getValue()).filter(
+			({ task }) =>
+				task.id === todoistTask.id && !tasksEquals(task, todoistTask),
+		);
 
-		if (!changes.length) return;
-
-		await this.app.vault.modify(file, replaceTasksInContent(content, changes));
+		for (const { from, to } of changes) {
+			editor.replaceRange(updatedTask, from, to);
+		}
 	};
 
 	#createUserInfoQueryObserver() {

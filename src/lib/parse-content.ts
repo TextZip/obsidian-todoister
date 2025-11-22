@@ -1,3 +1,4 @@
+import type { EditorPosition } from "obsidian";
 import type { ObsidianTask } from "./task/obsidian-task.ts";
 import { obsidianTaskParse } from "./task/obsidian-task-parse.ts";
 
@@ -5,9 +6,11 @@ export type ParseResults = {
 	task: ObsidianTask;
 	lineNumber: number;
 	isNew: boolean;
+	from: EditorPosition;
+	to: EditorPosition;
 }[];
 
-export function parseFileContent(content: string): ParseResults {
+export function parseContent(content: string): ParseResults {
 	const parseResults: ParseResults = [];
 	const lines = content.split("\n");
 	let inCodeBlock = false;
@@ -24,19 +27,22 @@ export function parseFileContent(content: string): ParseResults {
 			continue;
 		}
 
-		const taskMatch = line.match(/^\s*(- \[.+)$/);
+		const taskMatch = line.match(/^(\s*)(- \[.+)$/);
 
 		if (!taskMatch) {
 			continue;
 		}
 
-		const taskString = taskMatch[1];
+		const indent = taskMatch[1];
+		const taskString = taskMatch[2];
 		const parseResult = obsidianTaskParse(taskString);
 
 		if (parseResult) {
 			parseResults.push({
 				...parseResult,
 				lineNumber,
+				from: { line: lineNumber, ch: indent.length },
+				to: { line: lineNumber, ch: line.length },
 			});
 		}
 	}
