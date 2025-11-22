@@ -1,4 +1,8 @@
-import { type Task, TodoistApi } from "@doist/todoist-api-typescript";
+import {
+	type CurrentUser,
+	type Task,
+	TodoistApi,
+} from "@doist/todoist-api-typescript";
 import {
 	MutationObserver,
 	type QueryClient,
@@ -7,31 +11,30 @@ import {
 } from "@tanstack/query-core";
 import type { Persister } from "@tanstack/query-persist-client-core";
 import type { TFile } from "obsidian";
-import { Notice, Plugin, requestUrl } from "obsidian";
+import { Notice, Plugin } from "obsidian";
 import { createQueryClient } from "./lib/create-query-client.ts";
-import { createObsidianFetchAdapter } from "./lib/obsidian-fetch-adapter.ts";
+import { obsidianFetchAdapter } from "./lib/obsidian-fetch-adapter.ts";
 import {
 	type ParseResults,
 	parseFileContent,
 } from "./lib/parse-file-content.ts";
 import { replaceTasksInContent } from "./lib/replace-tasks-in-content.ts";
-import { TodoistSettingTab } from "./lib/settings-tab.ts";
+import { TodoisterSettingTab } from "./lib/settings-tab.ts";
 import { convertTodoistToObsidian } from "./lib/task/convert-todoist-to-obsidian.ts";
 import { isObsidianId } from "./lib/task/is-obsidian-id.ts";
 import type { ObsidianTask } from "./lib/task/obsidian-task.ts";
 import { tasksEquals } from "./lib/task/tasks-equals.ts";
 
 interface PluginData {
-	todoistApiToken: string;
+	oauthAccessToken?: string;
 	todoistProjectId: string;
 	queryCache?: string;
 }
 
 interface ActiveFileCacheItemTodoist {
 	task: ObsidianTask;
-	parsedAt: number;
 	updatedAt?: number;
-	query: Pick<QueryObserver<unknown>, "subscribe" | "destroy">;
+	query: Pick<QueryObserver<Task>, "subscribe" | "destroy">;
 	updateContent: Pick<
 		MutationObserver<unknown, Error, { content: string }>,
 		"mutate"
@@ -44,7 +47,6 @@ interface ActiveFileCacheItemTodoist {
 
 interface ActiveFileCacheItemObsidian {
 	task: ObsidianTask;
-	parsedAt: number;
 	updatedAt?: number;
 	create: Pick<MutationObserver<unknown, Error, void>, "mutate">;
 }
@@ -59,28 +61,31 @@ function isObsidianCacheItem(
 	return isObsidianId(item.task.id);
 }
 
-const DEFAULT_SETTINGS: Pick<
-	PluginData,
-	"todoistApiToken" | "todoistProjectId"
-> = {
-	todoistApiToken: "",
+const DEFAULT_SETTINGS: Pick<PluginData, "todoistProjectId"> = {
 	todoistProjectId: "",
 };
 
-export default class TodoistSyncPlugin extends Plugin {
+export default class TodoisterPlugin extends Plugin {
 	#data!: PluginData;
-	#timeout?: number;
-	#todoistClient!: TodoistApi;
+	#timeout?: ReturnType<typeof setTimeout>;
+	todoistClient: TodoistApi | undefined;
 	#queryClient!: QueryClient;
 	#unsubscribePersist?: VoidFunction;
 	#activeFileCache = new Map<string, ActiveFileCacheItem>();
+	oauthState?: string;
+	userInfoObserver?: Pick<QueryObserver<CurrentUser>, "subscribe" | "destroy">;
+	oauthCallbackResolver?: (code: string) => void;
+	oauthCallbackRejector?: (error: Error) => void;
 
-	get todoistApiToken(): string {
-		return this.#data.todoistApiToken;
+	get oauthAccessToken(): string | undefined {
+		return this.#data.oauthAccessToken;
 	}
 
-	set todoistApiToken(value: string) {
-		this.#data.todoistApiToken = value;
+	set oauthAccessToken(value: string | undefined) {
+		this.#data.oauthAccessToken = value;
+
+		this.#initClient();
+		this.#saveData();
 	}
 
 	get todoistProjectId(): string {
@@ -89,21 +94,46 @@ export default class TodoistSyncPlugin extends Plugin {
 
 	set todoistProjectId(value: string) {
 		this.#data.todoistProjectId = value;
+
+		this.#saveData();
 	}
 
 	async onload() {
 		await this.#loadData();
-
-		this.addSettingTab(new TodoistSettingTab(this.app, this));
-
-		if (!this.#checkRequirements()) return;
-
 		this.#initClient();
-
 		await this.#initQueryClient();
 
-		this.registerEvent(this.app.workspace.on("file-open", this.#onFileOpen));
+		this.userInfoObserver = this.#createUserInfoQueryObserver();
 
+		this.addSettingTab(new TodoisterSettingTab(this.app, this));
+
+		this.registerObsidianProtocolHandler("todoister-oauth", (params) => {
+			const code = params.code;
+			const state = params.state;
+			const error = params.error;
+
+			if (error) {
+				this.oauthCallbackRejector?.(new Error(`OAuth error: ${error}`));
+				return;
+			}
+
+			if (!code || !state) {
+				this.oauthCallbackRejector?.(new Error("Missing code or state"));
+				return;
+			}
+
+			if (state !== this.oauthState) {
+				this.oauthCallbackRejector?.(
+					new Error("State mismatch - possible CSRF attack"),
+				);
+				this.oauthState = undefined;
+				return;
+			}
+
+			this.oauthCallbackResolver?.(code);
+		});
+
+		this.registerEvent(this.app.workspace.on("file-open", this.#onFileOpen));
 		this.registerEvent(
 			this.app.workspace.on("editor-change", this.#onEditorChange),
 		);
@@ -118,25 +148,30 @@ export default class TodoistSyncPlugin extends Plugin {
 	onunload(): void {
 		this.#clearActiveFileCache();
 		this.#unsubscribePersist?.();
+		this.userInfoObserver?.destroy();
 		this.#queryClient?.clear();
 	}
 
-	async savePluginData() {
-		await this.saveData(this.#data);
+	#saveData() {
+		this.checkRequirements();
 
-		this.#checkRequirements();
-
-		this.#initClient();
+		return this.saveData(this.#data);
 	}
 
 	async #loadData() {
 		this.#data = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+
+		this.checkRequirements();
 	}
 
 	#initClient(): void {
-		this.#todoistClient = new TodoistApi(this.#data.todoistApiToken, {
-			customFetch: createObsidianFetchAdapter(requestUrl),
-		});
+		if (this.#data.oauthAccessToken) {
+			this.todoistClient = new TodoistApi(this.#data.oauthAccessToken, {
+				customFetch: obsidianFetchAdapter,
+			});
+		} else {
+			this.todoistClient = undefined;
+		}
 	}
 
 	async #initQueryClient() {
@@ -165,14 +200,16 @@ export default class TodoistSyncPlugin extends Plugin {
 		this.#unsubscribePersist = unsubscribe;
 	}
 
-	#checkRequirements(): boolean {
-		if (!this.#data.todoistApiToken) {
-			new Notice("Todoist Sync: Please configure your API token in settings");
+	checkRequirements(): this is this & {
+		readonly todoistClient: TodoistApi;
+	} {
+		if (!this.#data.oauthAccessToken || !this.todoistClient) {
+			new Notice("Please connect your Todoist account in settings");
 			return false;
 		}
 
 		if (!this.#data.todoistProjectId) {
-			new Notice("Todoist Sync: Please configure your project ID in settings");
+			new Notice("Please configure your project ID in settings");
 			return false;
 		}
 
@@ -200,13 +237,17 @@ export default class TodoistSyncPlugin extends Plugin {
 	#createGetTaskQueryObserver = (id: string) =>
 		new QueryObserver(this.#queryClient, {
 			queryKey: ["task", id],
-			queryFn: () => this.#todoistClient.getTask(id),
+			// biome-ignore lint/style/noNonNullAssertion: query is disabled when client is undefined
+			queryFn: () => this.todoistClient!.getTask(id),
+			enabled: Boolean(this.todoistClient),
 		});
 
 	#createUpdateTaskMutationObserver = (taskId: string) =>
 		new MutationObserver(this.#queryClient, {
-			mutationFn: ({ content }: { content: string }) =>
-				this.#todoistClient.updateTask(taskId, { content }),
+			mutationFn: ({ content }: { content: string }) => {
+				if (!this.checkRequirements()) return Promise.reject();
+				return this.todoistClient.updateTask(taskId, { content });
+			},
 			onMutate: async ({ content }) => {
 				this.#queryClient.cancelQueries({ queryKey: ["task", taskId] });
 				this.#queryClient.setQueryData(["task", taskId], (oldData: Task) => ({
@@ -218,10 +259,12 @@ export default class TodoistSyncPlugin extends Plugin {
 
 	#createSetCheckedTaskMutationObserver = (taskId: string) =>
 		new MutationObserver(this.#queryClient, {
-			mutationFn: ({ checked }: { checked: boolean }) =>
-				checked
-					? this.#todoistClient.closeTask(taskId)
-					: this.#todoistClient.reopenTask(taskId),
+			mutationFn: ({ checked }: { checked: boolean }) => {
+				if (!this.checkRequirements()) return Promise.reject();
+				return checked
+					? this.todoistClient.closeTask(taskId)
+					: this.todoistClient.reopenTask(taskId);
+			},
 			onMutate: async ({ checked }) => {
 				this.#queryClient.cancelQueries({ queryKey: ["task", taskId] });
 				this.#queryClient.setQueryData(["task", taskId], (oldData: Task) => ({
@@ -233,15 +276,17 @@ export default class TodoistSyncPlugin extends Plugin {
 
 	#createCreateTaskMutationObserver = (task: ObsidianTask) =>
 		new MutationObserver(this.#queryClient, {
-			mutationFn: () =>
-				this.#todoistClient.addTask({
+			mutationFn: () => {
+				if (!this.checkRequirements()) return Promise.reject();
+				return this.todoistClient.addTask({
 					content: task.content,
 					projectId: this.#data.todoistProjectId,
-				}),
+				});
+			},
 			onSuccess: async (todoistTask) => {
 				const file = this.app.workspace.getActiveFile();
 
-				if (file) {
+				if (file && todoistTask) {
 					const content = await this.app.vault.read(file);
 
 					if (content.includes(task.id)) {
@@ -285,21 +330,13 @@ export default class TodoistSyncPlugin extends Plugin {
 							content: task.content,
 						});
 					}
+
+					cacheItem.updatedAt = undefined;
 				}
 
 				cacheItem.task = task;
 			} else {
-				if (isObsidianId(task.id)) {
-					this.#addToActiveFileCache(
-						task.id,
-						this.#createObsidianCacheEntry(task),
-					);
-				} else {
-					this.#addToActiveFileCache(
-						task.id,
-						this.#createTodoistCacheEntry(task),
-					);
-				}
+				this.#addToActiveFileCache(task.id, this.#createCacheEntry(task));
 			}
 		}
 
@@ -326,12 +363,19 @@ export default class TodoistSyncPlugin extends Plugin {
 		this.#activeFileCache.delete(id);
 	}
 
+	#createCacheEntry(task: Task | ObsidianTask): ActiveFileCacheItem {
+		if (isObsidianId(task.id)) {
+			return this.#createObsidianCacheEntry(task);
+		} else {
+			return this.#createTodoistCacheEntry(task);
+		}
+	}
+
 	#createTodoistCacheEntry(task: ObsidianTask): ActiveFileCacheItemTodoist {
 		const query = this.#createGetTaskQueryObserver(task.id);
 
 		const cacheEntry: ActiveFileCacheItemTodoist = {
 			task,
-			parsedAt: Date.now(),
 			query,
 			updateContent: this.#createUpdateTaskMutationObserver(task.id),
 			toggleCheck: this.#createSetCheckedTaskMutationObserver(task.id),
@@ -355,7 +399,6 @@ export default class TodoistSyncPlugin extends Plugin {
 
 		return {
 			task,
-			parsedAt: Date.now(),
 			create,
 		};
 	}
@@ -401,7 +444,7 @@ export default class TodoistSyncPlugin extends Plugin {
 			}
 
 			this.#updateActiveFileCache(parseResults);
-		}, 500);
+		}, 1000);
 	};
 
 	#onQueryUpdate = async ({
@@ -435,4 +478,13 @@ export default class TodoistSyncPlugin extends Plugin {
 
 		await this.app.vault.modify(file, replaceTasksInContent(content, changes));
 	};
+
+	#createUserInfoQueryObserver() {
+		return new QueryObserver(this.#queryClient, {
+			queryKey: ["user"] as const,
+			// biome-ignore lint/style/noNonNullAssertion: query is disabled when client is undefined
+			queryFn: () => this.todoistClient!.getUser(),
+			enabled: () => Boolean(this.todoistClient),
+		});
+	}
 }
