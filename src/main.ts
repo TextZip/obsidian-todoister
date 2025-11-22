@@ -1,18 +1,14 @@
 import { type Task, TodoistApi } from "@doist/todoist-api-typescript";
 import {
 	MutationObserver,
-	QueryClient,
+	type QueryClient,
 	QueryObserver,
 	type QueryObserverResult,
 } from "@tanstack/query-core";
-import {
-	type PersistedClient,
-	type Persister,
-	persistQueryClientRestore,
-	persistQueryClientSubscribe,
-} from "@tanstack/query-persist-client-core";
+import type { Persister } from "@tanstack/query-persist-client-core";
 import type { TFile } from "obsidian";
 import { Notice, Plugin, requestUrl } from "obsidian";
+import { createQueryClient } from "./lib/create-query-client.ts";
 import { createObsidianFetchAdapter } from "./lib/obsidian-fetch-adapter.ts";
 import {
 	type ParseResults,
@@ -76,7 +72,7 @@ export default class TodoistSyncPlugin extends Plugin {
 	#timeout?: number;
 	#todoistClient!: TodoistApi;
 	#queryClient!: QueryClient;
-	#unsubscribePersist?: () => void;
+	#unsubscribePersist?: VoidFunction;
 	#activeFileCache = new Map<string, ActiveFileCacheItem>();
 
 	get todoistApiToken(): string {
@@ -103,6 +99,7 @@ export default class TodoistSyncPlugin extends Plugin {
 		if (!this.#checkRequirements()) return;
 
 		this.#initClient();
+
 		await this.#initQueryClient();
 
 		this.registerEvent(this.app.workspace.on("file-open", this.#onFileOpen));
@@ -116,15 +113,12 @@ export default class TodoistSyncPlugin extends Plugin {
 		if (activeFile) {
 			await this.#onFileOpen(activeFile);
 		}
-
-		console.log("Simple Todoist Sync plugin loaded");
 	}
 
 	onunload(): void {
 		this.#clearActiveFileCache();
 		this.#unsubscribePersist?.();
 		this.#queryClient?.clear();
-		console.log("Unloading Simple Todoist Sync plugin");
 	}
 
 	async savePluginData() {
@@ -146,25 +140,15 @@ export default class TodoistSyncPlugin extends Plugin {
 	}
 
 	async #initQueryClient() {
-		this.#queryClient = new QueryClient({
-			defaultOptions: {
-				queries: {
-					gcTime: 1000 * 60 * 60 * 24, // 24 hours
-					staleTime: 1000 * 60 * 5, // 5 minutes
-					retry: 3,
-				},
-			},
-		});
-
 		const persister: Persister = {
-			persistClient: async (client: PersistedClient) => {
+			persistClient: async (client) => {
 				this.#data.queryCache = JSON.stringify(client);
 				await this.saveData(this.#data);
 			},
 			restoreClient: async () => {
 				if (!this.#data.queryCache) return undefined;
 				try {
-					return JSON.parse(this.#data.queryCache) as PersistedClient;
+					return JSON.parse(this.#data.queryCache);
 				} catch {
 					return undefined;
 				}
@@ -175,16 +159,10 @@ export default class TodoistSyncPlugin extends Plugin {
 			},
 		};
 
-		await persistQueryClientRestore({
-			queryClient: this.#queryClient,
-			persister,
-			maxAge: 1000 * 60 * 60 * 24, // 24 hours
-		});
+		const { queryClient, unsubscribe } = await createQueryClient({ persister });
 
-		this.#unsubscribePersist = persistQueryClientSubscribe({
-			queryClient: this.#queryClient,
-			persister,
-		});
+		this.#queryClient = queryClient;
+		this.#unsubscribePersist = unsubscribe;
 	}
 
 	#checkRequirements(): boolean {
@@ -229,8 +207,6 @@ export default class TodoistSyncPlugin extends Plugin {
 		new MutationObserver(this.#queryClient, {
 			mutationFn: ({ content }: { content: string }) =>
 				this.#todoistClient.updateTask(taskId, { content }),
-			retry: 3,
-			retryDelay: (attemptIndex) => 1000 * 2 ** attemptIndex,
 			onMutate: async ({ content }) => {
 				this.#queryClient.cancelQueries({ queryKey: ["task", taskId] });
 				this.#queryClient.setQueryData(["task", taskId], (oldData: Task) => ({
@@ -246,8 +222,6 @@ export default class TodoistSyncPlugin extends Plugin {
 				checked
 					? this.#todoistClient.closeTask(taskId)
 					: this.#todoistClient.reopenTask(taskId),
-			retry: 3,
-			retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 30000),
 			onMutate: async ({ checked }) => {
 				this.#queryClient.cancelQueries({ queryKey: ["task", taskId] });
 				this.#queryClient.setQueryData(["task", taskId], (oldData: Task) => ({
@@ -264,8 +238,6 @@ export default class TodoistSyncPlugin extends Plugin {
 					content: task.content,
 					projectId: this.#data.todoistProjectId,
 				}),
-			retry: 3,
-			retryDelay: (attemptIndex) => Math.min(1000 * 2 ** attemptIndex, 30000),
 			onSuccess: async (todoistTask) => {
 				const file = this.app.workspace.getActiveFile();
 
@@ -336,8 +308,6 @@ export default class TodoistSyncPlugin extends Plugin {
 				this.#deleteFromActiveFileCache(taskId);
 			}
 		}
-
-		console.log(this.#activeFileCache);
 	}
 
 	#addToActiveFileCache(id: string, item: ActiveFileCacheItem) {

@@ -18,7 +18,6 @@ export class TodoistSettingTab extends PluginSettingTab {
 
 		containerEl.createEl("h2", { text: "Simple Todoist Sync Settings" });
 
-		// API Token input
 		new Setting(containerEl)
 			.setName("Todoist API Token")
 			.setDesc(
@@ -34,18 +33,6 @@ export class TodoistSettingTab extends PluginSettingTab {
 					}),
 			);
 
-		// Security warning
-		const warningEl = containerEl.createEl("div", {
-			cls: "mod-warning",
-		});
-		warningEl.createEl("p", {
-			text:
-				"⚠️ Security Note: Your API token is stored in plain text in .obsidian/plugins/. " +
-				"Avoid syncing your vault to untrusted cloud services or shared folders. " +
-				"Use Obsidian Sync, iCloud, or trusted providers. Regenerate your token if compromised.",
-		});
-
-		// Project ID input
 		new Setting(containerEl)
 			.setName("Project ID")
 			.setDesc("Todoist project ID where tasks will be created (required)")
