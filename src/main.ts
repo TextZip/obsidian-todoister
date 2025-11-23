@@ -13,6 +13,8 @@ import type {
 import type { Persister } from "@tanstack/query-persist-client-core";
 import {
 	type Editor,
+	type EditorPosition,
+	type MarkdownFileInfo,
 	type MarkdownView,
 	Notice,
 	Plugin,
@@ -79,7 +81,7 @@ const DEFAULT_SETTINGS: Pick<PluginData, "todoistProjectId"> = {
 
 export default class TodoisterPlugin extends Plugin {
 	#data!: PluginData;
-	#timeout?: ReturnType<typeof setTimeout>;
+	#processContentChangeTimeout?: ReturnType<typeof setTimeout>;
 	todoistClient: TodoistApi | undefined;
 	#queryClient!: QueryClient;
 	#unsubscribePersist?: VoidFunction;
@@ -132,35 +134,10 @@ export default class TodoisterPlugin extends Plugin {
 
 		this.addSettingTab(new TodoisterSettingTab(this.app, this));
 
-		this.registerObsidianProtocolHandler("todoister-oauth", (params) => {
-			const code = params.code;
-			const state = params.state;
-			const error = params.error;
-
-			if (error) {
-				this.oauthCallbackRejector?.(new Error(`OAuth error: ${error}`));
-				return;
-			}
-
-			if (!code || !state) {
-				this.oauthCallbackRejector?.(new Error("Missing code or state"));
-				return;
-			}
-
-			if (state !== this.oauthState) {
-				this.oauthCallbackRejector?.(
-					new Error("State mismatch - possible CSRF attack"),
-				);
-				this.oauthState = undefined;
-				return;
-			}
-
-			this.oauthCallbackResolver?.(code);
-		});
+		this.registerObsidianProtocolHandler("todoister-oauth", this.#onOauth);
 
 		this.registerEvent(this.app.workspace.on("file-open", this.#onFileOpen));
 		this.registerEvent(
-			// @ts-expect-error - editor-change event exists but is not in type definitions
 			this.app.workspace.on("editor-change", this.#onEditorChange),
 		);
 
@@ -171,7 +148,7 @@ export default class TodoisterPlugin extends Plugin {
 		}
 	}
 
-	onunload(): void {
+	onunload() {
 		this.#clearActiveFileCache();
 		this.#unsubscribePersist?.();
 		this.userInfoObserver?.destroy();
@@ -191,7 +168,7 @@ export default class TodoisterPlugin extends Plugin {
 		this.checkRequirements();
 	}
 
-	#initClient(): void {
+	#initClient() {
 		if (this.#data.oauthAccessToken) {
 			this.todoistClient = new TodoistApi(this.#data.oauthAccessToken, {
 				customFetch: obsidianFetchAdapter,
@@ -255,11 +232,36 @@ export default class TodoisterPlugin extends Plugin {
 		if (!file) return false;
 
 		return (
-			this.app.metadataCache.getFileCache(file)?.frontmatter?.[
-				"todoist-sync"
-			] === true
+			this.app.metadataCache.getFileCache(file)?.frontmatter?.todoister === true
 		);
 	}
+
+	#onOauth = ({ code, state, error }: Record<string, string>) => {
+		if (error) {
+			this.oauthCallbackRejector?.(
+				new Error(`OAuth error: ${error}`, { cause: error }),
+			);
+			return;
+		}
+
+		if (!code) {
+			this.oauthCallbackRejector?.(new Error("Missing oauth code"));
+			return;
+		}
+
+		if (!state) {
+			this.oauthCallbackRejector?.(new Error("Missing oauth state"));
+			return;
+		}
+
+		if (state !== this.oauthState) {
+			this.oauthCallbackRejector?.(new Error("Oauth state mismatch"));
+			this.oauthState = undefined;
+			return;
+		}
+
+		this.oauthCallbackResolver?.(code);
+	};
 
 	#clearActiveFileCache(): void {
 		for (const cacheEntry of this.#activeFileCache.values()) {
@@ -407,7 +409,7 @@ export default class TodoisterPlugin extends Plugin {
 				const from = editor.offsetToPos(offset);
 				const to = editor.offsetToPos(offset + id.length);
 
-				editor.replaceRange(todoistTask.id, from, to);
+				this.#replaceRange(editor, todoistTask.id, from, to);
 
 				this.#addToActiveFileCache(
 					todoistTask.id,
@@ -423,47 +425,57 @@ export default class TodoisterPlugin extends Plugin {
 		};
 	}
 
-	#onFileOpen = (file: TFile | null) => {
-		if (!this.#pluginIsEnabled(file)) {
-			this.#clearActiveFileCache();
-			return;
-		}
+	#replaceRange(
+		editor: Editor,
+		text: string,
+		from: EditorPosition,
+		to: EditorPosition,
+	) {
+		editor.replaceRange(text, from, to);
+		clearTimeout(this.#processContentChangeTimeout);
+	}
 
+	#handleContentUpdate = () => {
 		const editor = this.app.workspace.activeEditor?.editor;
 
 		if (!editor) return;
 
 		const parseResults = parseContent(editor.getValue());
 
-		this.#updateActiveFileCache(parseResults);
-
-		const newTasks = parseResults.filter(({ isNew }) => isNew);
-
-		for (const { task, from, to } of newTasks) {
-			editor.replaceRange(obsidianTaskStringify(task), from, to);
+		for (const { task, from, to } of parseResults.filter(
+			({ isNew }) => isNew,
+		)) {
+			this.#replaceRange(editor, obsidianTaskStringify(task), from, to);
 		}
+
+		this.#updateActiveFileCache(parseResults);
 	};
 
-	#onEditorChange = (editor: Editor, view: MarkdownView) => {
-		if (!this.#pluginIsEnabled(view.file)) return;
+	#onFileOpen = (file: TFile | null) => {
+		if (!this.#pluginIsEnabled(file)) {
+			this.#clearActiveFileCache();
+			return;
+		}
 
-		const content = editor.getValue();
+		this.#handleContentUpdate();
+	};
 
-		clearTimeout(this.#timeout);
+	#onEditorChange = (
+		_editor: Editor,
+		info: MarkdownView | MarkdownFileInfo,
+	) => {
+		clearTimeout(this.#processContentChangeTimeout);
 
-		this.#timeout = setTimeout(() => {
-			this.#timeout = undefined;
+		this.#processContentChangeTimeout = setTimeout(() => {
+			console.log("edit processed");
+			if (!this.#pluginIsEnabled(info.file)) return;
 
-			const parseResults = parseContent(content);
+			this.#processContentChangeTimeout = undefined;
 
-			const newTasks = parseResults.filter(({ isNew }) => isNew);
-
-			for (const { task, from, to } of newTasks) {
-				editor.replaceRange(obsidianTaskStringify(task), from, to);
-			}
-
-			this.#updateActiveFileCache(parseResults);
+			this.#handleContentUpdate();
 		}, 1000);
+
+		console.log(this.#processContentChangeTimeout, "timeout");
 	};
 
 	#onQueryUpdate = ({
@@ -490,7 +502,7 @@ export default class TodoisterPlugin extends Plugin {
 		);
 
 		for (const { from, to } of changes) {
-			editor.replaceRange(updatedTask, from, to);
+			this.#replaceRange(editor, updatedTask, from, to);
 		}
 	};
 }
