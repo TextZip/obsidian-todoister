@@ -1,7 +1,7 @@
 {
-	"name": "obsidian-todoist-sync",
+	"name": "obsidian-todoister-plugin",
 	"version": "0.1.0",
-	"description": "Simple bi-directional sync between Obsidian and Todoist",
+	"description": "Sync all todo from active file between Obsidian and Todoist.",
 	"type": "module",
 	"main": "main.js",
 	"scripts": {
