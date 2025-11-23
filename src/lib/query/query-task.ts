@@ -1,8 +1,8 @@
 import { type QueryClient, QueryObserver } from "@tanstack/query-core";
 
-export const taskQueryKey = (taskId: string) => ["task", taskId] as const;
+export const queryTaskKey = (taskId: string) => ["task", taskId] as const;
 
-export const taskQuery = <T>({
+export const queryTask = <T>({
 	queryClient,
 	taskId,
 	queryFn,
@@ -12,6 +12,6 @@ export const taskQuery = <T>({
 	queryFn: () => Promise<T>;
 }) =>
 	new QueryObserver(queryClient, {
-		queryKey: taskQueryKey(taskId),
+		queryKey: queryTaskKey(taskId),
 		queryFn,
 	});

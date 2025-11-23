@@ -1,10 +1,10 @@
 import { MutationObserver, type QueryClient } from "@tanstack/query-core";
-import { taskQueryKey } from "./task-query.ts";
+import { queryTaskKey } from "./query-task.ts";
 
-export const updateTaskMutationKey = (taskId: string) =>
+const mutationUpdateTaskKey = (taskId: string) =>
 	["set-content", taskId] as const;
 
-export const updateTaskMutation = <TData>({
+export const mutationUpdateTask = <TData>({
 	queryClient,
 	taskId,
 	mutationFn,
@@ -14,13 +14,13 @@ export const updateTaskMutation = <TData>({
 	mutationFn: (variables: { content: string }) => Promise<TData>;
 }) =>
 	new MutationObserver(queryClient, {
-		mutationKey: updateTaskMutationKey(taskId),
+		mutationKey: mutationUpdateTaskKey(taskId),
 		mutationFn,
 		onMutate: async ({ content }) => {
 			queryClient.cancelQueries({
-				queryKey: taskQueryKey(taskId),
+				queryKey: queryTaskKey(taskId),
 			});
-			queryClient.setQueryData(taskQueryKey(taskId), (oldData: TData) => ({
+			queryClient.setQueryData(queryTaskKey(taskId), (oldData: TData) => ({
 				...oldData,
 				content,
 			}));

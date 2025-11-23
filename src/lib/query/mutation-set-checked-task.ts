@@ -1,10 +1,10 @@
 import { MutationObserver, type QueryClient } from "@tanstack/query-core";
-import { taskQueryKey } from "./task-query.ts";
+import { queryTaskKey } from "./query-task.ts";
 
-export const setCheckedTaskMutationKey = (taskId: string) =>
+const mutationSetCheckedTaskKey = (taskId: string) =>
 	["set-checked", taskId] as const;
 
-export const setCheckedTaskMutation = <TData>({
+export const mutationSetCheckedTask = <TData>({
 	queryClient,
 	taskId,
 	mutationFn,
@@ -14,13 +14,13 @@ export const setCheckedTaskMutation = <TData>({
 	mutationFn: (variables: { checked: boolean }) => Promise<TData>;
 }) =>
 	new MutationObserver(queryClient, {
-		mutationKey: setCheckedTaskMutationKey(taskId),
+		mutationKey: mutationSetCheckedTaskKey(taskId),
 		mutationFn,
 		onMutate: ({ checked }) => {
 			queryClient.cancelQueries({
-				queryKey: taskQueryKey(taskId),
+				queryKey: queryTaskKey(taskId),
 			});
-			queryClient.setQueryData(taskQueryKey(taskId), (oldData: TData) => ({
+			queryClient.setQueryData(queryTaskKey(taskId), (oldData: TData) => ({
 				...oldData,
 				checked,
 			}));
