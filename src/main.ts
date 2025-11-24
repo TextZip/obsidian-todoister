@@ -38,7 +38,7 @@ import { tasksEquals } from "./lib/task/tasks-equals.ts";
 
 interface PluginData {
 	oauthAccessToken?: string;
-	todoistProjectId: string;
+	todoistProjectId?: string;
 	queryCache?: string;
 }
 
@@ -75,10 +75,6 @@ function isObsidianCacheItem(
 	return "add" in item;
 }
 
-const DEFAULT_SETTINGS: Pick<PluginData, "todoistProjectId"> = {
-	todoistProjectId: "",
-};
-
 export default class TodoisterPlugin extends Plugin {
 	#data!: PluginData;
 	#processContentChangeTimeout?: ReturnType<typeof setTimeout>;
@@ -107,11 +103,11 @@ export default class TodoisterPlugin extends Plugin {
 	}
 
 	get todoistProjectId(): string {
-		return this.#data.todoistProjectId;
+		return this.#data.todoistProjectId ?? "";
 	}
 
 	set todoistProjectId(value: string) {
-		this.#data.todoistProjectId = value;
+		this.#data.todoistProjectId = value === "" ? undefined : value;
 
 		this.#saveData();
 	}
@@ -163,7 +159,7 @@ export default class TodoisterPlugin extends Plugin {
 	}
 
 	async #loadData() {
-		this.#data = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+		this.#data = await this.loadData();
 
 		this.checkRequirements();
 	}
@@ -339,15 +335,13 @@ export default class TodoisterPlugin extends Plugin {
 	}
 
 	#createTodoistCacheEntry(task: ObsidianTask): ActiveFileCacheItemTodoist {
-		const query = queryTask({
-			queryClient: this.#queryClient,
-			taskId: task.id,
-			// biome-ignore lint/style/noNonNullAssertion: query is disabled globally when client is undefined
-			queryFn: () => this.todoistClient!.getTask(task.id),
-		});
-
 		const cacheEntry: ActiveFileCacheItemTodoist = {
-			query,
+			query: queryTask({
+				queryClient: this.#queryClient,
+				taskId: task.id,
+				// biome-ignore lint/style/noNonNullAssertion: query is disabled globally when client is undefined
+				queryFn: () => this.todoistClient!.getTask(task.id),
+			}),
 			updateContent: mutationUpdateTask({
 				queryClient: this.#queryClient,
 				taskId: task.id,
@@ -374,7 +368,7 @@ export default class TodoisterPlugin extends Plugin {
 			checked: task.checked,
 		});
 
-		query.subscribe(this.#onQueryUpdate);
+		cacheEntry.query.subscribe(this.#onQueryUpdate);
 
 		return cacheEntry;
 	}
