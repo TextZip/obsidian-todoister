@@ -25,46 +25,6 @@ export class TodoisterSettingTab extends PluginSettingTab {
 		} else {
 			this.#renderDisconnectedState(containerEl);
 		}
-
-		new Setting(containerEl)
-			.setName("Project")
-			.setDesc("Select the Todoist project where tasks will be created")
-			.addDropdown((dropdown) => {
-				dropdown.setValue(this.plugin.todoistProjectId);
-				dropdown.addOption("", "Loading projects...");
-				dropdown.setDisabled(true);
-				dropdown.onChange((value) => {
-					this.plugin.todoistProjectId = value;
-				});
-
-				this.#unsubscribeFromProjectList =
-					this.plugin.projectListObserver?.subscribe(({ status, data }) => {
-						console.log("get data", status);
-						if (status === "pending") {
-							dropdown.selectEl.empty();
-							dropdown.addOption("", "Loading projects...");
-							dropdown.setDisabled(true);
-						} else if (status === "success" && data) {
-							dropdown.selectEl.empty();
-							dropdown.addOption("", "–");
-
-							for (const { name, id } of data.results) {
-								dropdown.selectEl.createEl("option", {
-									value: id,
-									text: name,
-								});
-							}
-
-							dropdown.setValue(this.plugin.todoistProjectId);
-
-							dropdown.setDisabled(false);
-						} else if (status === "error") {
-							dropdown.selectEl.empty();
-							dropdown.addOption("", "Error loading projects");
-							dropdown.setDisabled(true);
-						}
-					});
-			});
 	}
 
 	hide() {
@@ -99,6 +59,45 @@ export class TodoisterSettingTab extends PluginSettingTab {
 				this.display();
 			}),
 		);
+
+		new Setting(containerEl)
+			.setName("Project")
+			.setDesc("Select the Todoist project where tasks will be created")
+			.addDropdown((dropdown) => {
+				dropdown.setValue(this.plugin.todoistProjectId);
+				dropdown.addOption("", "Initializing...");
+				dropdown.setDisabled(true);
+				dropdown.onChange((value) => {
+					this.plugin.todoistProjectId = value;
+				});
+
+				this.#unsubscribeFromProjectList =
+					this.plugin.projectListObserver?.subscribe(({ status, data }) => {
+						if (status === "pending") {
+							dropdown.selectEl.empty();
+							dropdown.addOption("", "Loading projects...");
+							dropdown.setDisabled(true);
+						} else if (status === "success" && data) {
+							dropdown.selectEl.empty();
+							dropdown.addOption("", "–");
+
+							for (const { name, id } of data.results) {
+								dropdown.selectEl.createEl("option", {
+									value: id,
+									text: name,
+								});
+							}
+
+							dropdown.setValue(this.plugin.todoistProjectId);
+
+							dropdown.setDisabled(false);
+						} else if (status === "error") {
+							dropdown.selectEl.empty();
+							dropdown.addOption("", "Error loading projects");
+							dropdown.setDisabled(true);
+						}
+					});
+			});
 	}
 
 	#unsubscribe = () => {
