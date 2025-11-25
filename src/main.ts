@@ -130,6 +130,18 @@ export default class TodoisterPlugin extends Plugin {
 
 		this.addSettingTab(new TodoisterSettingTab(this.app, this));
 
+		this.addCommand({
+			id: "enable-todoist-sync",
+			name: "Enable Todoist sync for current file",
+			checkCallback: this.#onEnableSync,
+		});
+
+		this.addCommand({
+			id: "disable-todoist-sync",
+			name: "Disable Todoist sync for current file",
+			checkCallback: this.#onDisableSync,
+		});
+
 		this.registerObsidianProtocolHandler("todoister-oauth", this.#onOauth);
 
 		this.registerEvent(this.app.workspace.on("file-open", this.#onFileOpen));
@@ -231,6 +243,38 @@ export default class TodoisterPlugin extends Plugin {
 			this.app.metadataCache.getFileCache(file)?.frontmatter?.todoister === true
 		);
 	}
+
+	async #toggleTodoistSync(file: TFile, enable: boolean) {
+		await this.app.fileManager.processFrontMatter(file, (frontmatter) => {
+			frontmatter.todoister = enable;
+		});
+
+		if (enable) {
+			this.#onFileOpen(file);
+		} else {
+			this.#clearActiveFileCache();
+		}
+	}
+
+	#onEnableSync = (checking: boolean) => {
+		const file = this.app.workspace.getActiveFile();
+		if (!file || this.#pluginIsEnabled(file)) return false;
+
+		if (!checking) {
+			this.#toggleTodoistSync(file, true);
+		}
+		return true;
+	};
+
+	#onDisableSync = (checking: boolean) => {
+		const file = this.app.workspace.getActiveFile();
+		if (!file || !this.#pluginIsEnabled(file)) return false;
+
+		if (!checking) {
+			this.#toggleTodoistSync(file, false);
+		}
+		return true;
+	};
 
 	#onOauth = ({ code, state, error }: Record<string, string>) => {
 		if (error) {
