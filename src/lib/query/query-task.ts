@@ -1,4 +1,4 @@
-import type { Task } from "@doist/todoist-api-typescript";
+import type { TodoistApi } from "@doist/todoist-api-typescript";
 import { type QueryClient, QueryObserver } from "@tanstack/query-core";
 import type { ObsidianTask } from "../task/obsidian-task.ts";
 
@@ -7,17 +7,17 @@ export const queryTaskKey = (taskId: string) => ["task", taskId] as const;
 export const queryTask = ({
 	queryClient,
 	taskId,
-	queryFn,
+	todoistApi,
 	initialData,
 }: {
 	queryClient: QueryClient;
 	taskId: string;
-	queryFn: () => Promise<Task>;
+	todoistApi: () => TodoistApi;
 	initialData: ObsidianTask;
 }) =>
 	new QueryObserver(queryClient, {
 		queryKey: queryTaskKey(taskId),
-		queryFn,
+		queryFn: () => todoistApi().getTask(taskId),
 		initialData,
 		select: ({ id, checked, content }): ObsidianTask => ({
 			id,

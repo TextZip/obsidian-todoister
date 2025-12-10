@@ -75,6 +75,15 @@ export default class TodoisterPlugin extends Plugin {
 	#queryClient!: QueryClient;
 	#unsubscribePersist?: VoidFunction;
 	#activeFileCache = new Map<string, ActiveFileCacheItem>();
+	#getTodoistClient = (): TodoistApi => {
+		const client = this.#todoistClient;
+
+		if (!client) {
+			throw new Error("Todoist client is not initialized");
+		}
+
+		return client;
+	};
 	oauthState?: string;
 	userInfoObserver?: Pick<QueryObserver<CurrentUser>, "subscribe" | "destroy">;
 	projectListObserver?: Pick<
@@ -112,11 +121,11 @@ export default class TodoisterPlugin extends Plugin {
 
 		this.userInfoObserver = queryUserInfo({
 			queryClient: this.#queryClient,
-			queryFn: () => this.#todoistClient!.getUser(),
+			todoistApi: this.#getTodoistClient,
 		});
 		this.projectListObserver = queryProjectList({
 			queryClient: this.#queryClient,
-			queryFn: () => this.#todoistClient!.getProjects(),
+			todoistApi: this.#getTodoistClient,
 		});
 
 		this.addSettingTab(new TodoisterSettingTab(this.app, this));
@@ -370,22 +379,18 @@ export default class TodoisterPlugin extends Plugin {
 			query: queryTask({
 				queryClient: this.#queryClient,
 				taskId: task.id,
-				queryFn: () => this.#todoistClient!.getTask(task.id),
+				todoistApi: this.#getTodoistClient,
 				initialData: task,
 			}),
 			updateContent: mutationUpdateTask({
 				queryClient: this.#queryClient,
 				taskId: task.id,
-				mutationFn: ({ content }) =>
-					this.#todoistClient!.updateTask(task.id, { content }),
+				todoistApi: this.#getTodoistClient,
 			}),
 			toggleCheck: mutationSetCheckedTask({
 				queryClient: this.#queryClient,
 				taskId: task.id,
-				mutationFn: ({ checked }) =>
-					checked
-						? this.#todoistClient!.closeTask(task.id)
-						: this.#todoistClient!.reopenTask(task.id),
+				todoistApi: this.#getTodoistClient,
 			}),
 		};
 
@@ -401,11 +406,8 @@ export default class TodoisterPlugin extends Plugin {
 		const add = mutationAddTask({
 			queryClient: this.#queryClient,
 			taskId: id,
-			mutationFn: (task) =>
-				this.#todoistClient!.addTask({
-					content: task.content,
-					projectId: this.#data.todoistProjectId,
-				}),
+			todoistApi: this.#getTodoistClient,
+			projectId: this.#data.todoistProjectId!,
 		});
 
 		add.mutate(task).then((todoistTask) => {
@@ -444,17 +446,15 @@ export default class TodoisterPlugin extends Plugin {
 		from: EditorPosition,
 		to: EditorPosition,
 	) {
-		const cursor = editor.getCursor();
 		editor.replaceRange(text, from, to);
-		editor.setCursor(cursor);
 		clearTimeout(this.#processContentChangeTimeout);
 	}
 
 	#handleContentUpdate = () => {
-        const editor = this.app.workspace.activeEditor?.editor;
-        
+		const editor = this.app.workspace.activeEditor?.editor;
+
 		if (!editor) return;
-        
+
 		const parseResults = parseContent(editor.getValue());
 
 		for (const { task, from, to } of parseResults.filter(

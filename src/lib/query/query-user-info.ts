@@ -1,15 +1,16 @@
+import type { CurrentUser, TodoistApi } from "@doist/todoist-api-typescript";
 import { type QueryClient, QueryObserver } from "@tanstack/query-core";
 
 const queryUserInfoKey = () => ["user"] as const;
 
-export const queryUserInfo = <T>({
+export const queryUserInfo = ({
 	queryClient,
-	queryFn,
+	todoistApi,
 }: {
 	queryClient: QueryClient;
-	queryFn: () => Promise<T>;
+	todoistApi: () => TodoistApi;
 }) =>
-	new QueryObserver(queryClient, {
+	new QueryObserver<CurrentUser>(queryClient, {
 		queryKey: queryUserInfoKey(),
-		queryFn,
+		queryFn: () => todoistApi().getUser(),
 	});

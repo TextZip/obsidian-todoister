@@ -1,3 +1,4 @@
+import type { TodoistApi } from "@doist/todoist-api-typescript";
 import { MutationObserver, type QueryClient } from "@tanstack/query-core";
 import { queryTaskKey } from "./query-task.ts";
 
@@ -7,15 +8,18 @@ const mutationSetCheckedTaskKey = (taskId: string) =>
 export const mutationSetCheckedTask = <TData>({
 	queryClient,
 	taskId,
-	mutationFn,
+	todoistApi,
 }: {
 	queryClient: QueryClient;
 	taskId: string;
-	mutationFn: (variables: { checked: boolean }) => Promise<TData>;
+	todoistApi: () => TodoistApi;
 }) =>
 	new MutationObserver(queryClient, {
 		mutationKey: mutationSetCheckedTaskKey(taskId),
-		mutationFn,
+		mutationFn: (variables: { checked: boolean }) =>
+			variables.checked
+				? todoistApi().closeTask(taskId)
+				: todoistApi().reopenTask(taskId),
 		onMutate: ({ checked }) => {
 			queryClient.cancelQueries({
 				queryKey: queryTaskKey(taskId),

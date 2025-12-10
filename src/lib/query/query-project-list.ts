@@ -1,17 +1,17 @@
-import type { GetProjectsResponse } from "@doist/todoist-api-typescript";
+import type { TodoistApi } from "@doist/todoist-api-typescript";
 import { type QueryClient, QueryObserver } from "@tanstack/query-core";
 
 const queryProjectListKey = () => ["projects"] as const;
 
 export const queryProjectList = ({
 	queryClient,
-	queryFn,
+	todoistApi,
 }: {
 	queryClient: QueryClient;
-	queryFn: () => Promise<GetProjectsResponse>;
+	todoistApi: () => TodoistApi;
 }) =>
 	new QueryObserver(queryClient, {
 		queryKey: queryProjectListKey(),
-		queryFn,
+		queryFn: () => todoistApi().getProjects(),
 		select: ({ results }) => results.map(({ id, name }) => ({ id, name })),
 	});
