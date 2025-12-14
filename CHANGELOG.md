@@ -1,3 +1,10 @@
+# [1.3.0](https://github.com/ErBlack/obsidian-todoister/compare/v1.2.0...v1.3.0) (2025-12-14)
+
+
+### Features
+
+* force resync current file ([#19](https://github.com/ErBlack/obsidian-todoister/issues/19)) ([e4b3234](https://github.com/ErBlack/obsidian-todoister/commit/e4b32342811dabf2688418706a0f0d9944a93e30))
+
 # [1.2.0](https://github.com/ErBlack/obsidian-todoister/compare/v1.1.0...v1.2.0) (2025-12-14)
 
 
