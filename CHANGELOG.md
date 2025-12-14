@@ -1,3 +1,10 @@
+# [1.4.0](https://github.com/ErBlack/obsidian-todoister/compare/v1.3.0...v1.4.0) (2025-12-14)
+
+
+### Features
+
+* hide id on inactive lines ([66126f3](https://github.com/ErBlack/obsidian-todoister/commit/66126f3a3ab22322d49af8ab22d6ffea22383803))
+
 # [1.3.0](https://github.com/ErBlack/obsidian-todoister/compare/v1.2.0...v1.3.0) (2025-12-14)
 
 
