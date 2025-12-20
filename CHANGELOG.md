@@ -1,3 +1,10 @@
+# [1.5.0](https://github.com/ErBlack/obsidian-todoister/compare/v1.4.0...v1.5.0) (2025-12-20)
+
+
+### Features
+
+* keep cursor position after edit ([#23](https://github.com/ErBlack/obsidian-todoister/issues/23)) ([cef42c6](https://github.com/ErBlack/obsidian-todoister/commit/cef42c61c0e9ba588d95a655732819eb8fb102dc))
+
 # [1.4.0](https://github.com/ErBlack/obsidian-todoister/compare/v1.3.0...v1.4.0) (2025-12-14)
 
 
