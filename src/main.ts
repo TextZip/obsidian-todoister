@@ -9,10 +9,11 @@ import type { Persister } from "@tanstack/query-persist-client-core";
 import {
 	type Editor,
 	type EditorPosition,
+	MarkdownView,
 	Notice,
 	Plugin,
-	type TFile,
-} from "obsidian";
+	TFile,
+} from "obsidian"; // NOT type-only
 import { obsidianFetchAdapter } from "./lib/obsidian-fetch-adapter.ts";
 import { type ParseResults, parseContent } from "./lib/parse-content.ts";
 import { createQueryClient } from "./lib/query/create-query-client.ts";
@@ -37,7 +38,12 @@ interface PluginData {
 }
 
 interface ActiveFileCacheItemTodoist {
-	updatedAt?: number;
+	/**
+	 * Timestamp (ms) of the last time we pushed an edit from Obsidian -> Todoist
+	 * Used as an echo-guard to ignore the immediately-following Todoist refetch.
+	 */
+	lastLocalEditAt?: number;
+
 	query: Pick<
 		QueryObserver<ObsidianTask | { deleted: true; id: string }>,
 		"subscribe" | "destroy" | "getCurrentResult"
@@ -53,7 +59,12 @@ interface ActiveFileCacheItemTodoist {
 }
 
 interface ActiveFileCacheItemObsidian {
-	updatedAt?: number;
+	/**
+	 * Timestamp (ms) of the last time we pushed an edit from Obsidian -> Todoist
+	 * (mostly irrelevant for "obsidian-id" placeholder entries, but kept for symmetry)
+	 */
+	lastLocalEditAt?: number;
+
 	add: Pick<MutationObserver<unknown, Error, { content: string }>, "mutate">;
 }
 
@@ -70,6 +81,8 @@ function isObsidianCacheItem(
 export default class TodoisterPlugin extends Plugin {
 	#data!: PluginData;
 	#processContentChangeTimeout?: ReturnType<typeof setTimeout>;
+	#processFileChangeTimeout?: ReturnType<typeof setTimeout>;
+	#selfWritingPaths = new Set<string>();
 	#todoistClient: TodoistApi | undefined;
 	#queryClient!: QueryClient;
 	#unsubscribePersist?: VoidFunction;
@@ -153,6 +166,9 @@ export default class TodoisterPlugin extends Plugin {
 		this.registerObsidianProtocolHandler("todoister-oauth", this.#onOauth);
 
 		this.registerEvent(this.app.workspace.on("file-open", this.#onFileOpen));
+		// this.registerEvent(this.app.vault.on("modify", (file) => this.#onVaultModify(file)));
+		this.registerEvent(this.app.vault.on("modify", this.#onVaultModify));
+		// this.registerDomEvent(this.app.workspace.containerEl,"click",this.#onPreviewCheckboxClick,);
 
 		this.registerEvent(
 			this.app.workspace.on("layout-change", this.#onLayoutChange),
@@ -230,6 +246,66 @@ export default class TodoisterPlugin extends Plugin {
 
 		this.#queryClient = queryClient;
 		this.#unsubscribePersist = unsubscribe;
+	}
+
+	#getActiveMarkdownView(): MarkdownView | null {
+		return this.app.workspace.getActiveViewOfType(MarkdownView);
+	}
+
+	#getActiveMode(): "source" | "preview" | "unknown" {
+		const view = this.#getActiveMarkdownView();
+		if (!view) return "unknown";
+
+		// MarkdownView supports getMode(): "source" | "preview"
+		const mode = view.getMode?.();
+		if (mode === "source" || mode === "preview") return mode;
+
+		// fallback for older/alt builds
+		const t = (view as any).currentMode?.type;
+		if (t === "source" || t === "preview") return t;
+
+		return "unknown";
+	}
+
+	#isReadingView(): boolean {
+		return this.#getActiveMode() === "preview";
+	}
+
+	#isEditingView(): boolean {
+		return this.#getActiveMode() === "source";
+	}
+
+	#onVaultModify = (file: unknown) => {
+		const active = this.app.workspace.getActiveFile();
+		if (!active) return;
+
+		// IMPORTANT: TFile must be runtime import: `import { TFile } from "obsidian"`
+		if (!(file instanceof TFile)) return;
+
+		// only care about active file
+		if (file.path !== active.path) return;
+
+		if (!this.#pluginIsEnabled(file)) return;
+		if (!this.#checkRequirements()) return;
+
+		// ignore our own writes
+		if (this.#selfWritingPaths.has(file.path)) return;
+
+		clearTimeout(this.#processFileChangeTimeout);
+		this.#processFileChangeTimeout = setTimeout(() => {
+			// parse from disk and push diffs to Todoist
+			void this.#handleContentUpdateFromFile(file);
+		}, 250);
+	};
+
+	async #vaultModifySelf(file: TFile, nextText: string) {
+		this.#selfWritingPaths.add(file.path);
+		try {
+			await this.app.vault.modify(file, nextText);
+		} finally {
+			// small delay to let Obsidian finish emitting modify/layout events
+			setTimeout(() => this.#selfWritingPaths.delete(file.path), 500);
+		}
 	}
 
 	#checkRequirements() {
@@ -323,7 +399,7 @@ export default class TodoisterPlugin extends Plugin {
 		this.#activeFileCache.clear();
 	}
 
-	#updateActiveFileCache(parseResults: ParseResults) {
+	#updateActiveFileCache(parseResults: ParseResults, allowPush = true) {
 		const existedTaskIds = new Set<string>();
 
 		for (const { task } of parseResults) {
@@ -332,31 +408,36 @@ export default class TodoisterPlugin extends Plugin {
 			const cacheItem = this.#activeFileCache.get(task.id);
 
 			if (cacheItem) {
-				if (isObsidianCacheItem(cacheItem)) {
-					cacheItem.updatedAt = Date.now();
-				} else {
+				// IMPORTANT:
+				// Do NOT set any "updatedAt" flag just because a task exists in the file.
+				// That blocks inbound Todoist updates forever (especially in Reading view).
+				if (!isObsidianCacheItem(cacheItem)) {
 					const { data: todoistTask } = cacheItem.query.getCurrentResult();
 
-					if (!todoistTask || "deleted" in todoistTask) continue; // should not happen, cache created on file read
+					if (!todoistTask || "deleted" in todoistTask) continue;
 
-					if (!tasksEquals(todoistTask, task)) {
+					if (allowPush && !tasksEquals(todoistTask, task)) {
+						let willMutate = false;
+
+						if (todoistTask.checked !== task.checked) willMutate = true;
+						if (todoistTask.content !== task.content) willMutate = true;
+
+						if (willMutate) cacheItem.lastLocalEditAt = Date.now();
+
 						if (todoistTask.checked !== task.checked) {
 							cacheItem.toggleCheck.mutate({ checked: task.checked });
 						}
 
 						if (todoistTask.content !== task.content) {
-							cacheItem.updateContent.mutate({
-								content: task.content,
-							});
+							cacheItem.updateContent.mutate({ content: task.content });
 						}
-
-						cacheItem.updatedAt = undefined;
 					}
 				}
 			} else {
 				this.#addToActiveFileCache(task.id, this.#createCacheEntry(task));
 			}
 		}
+
 		for (const [taskId] of this.#activeFileCache) {
 			if (!existedTaskIds.has(taskId)) {
 				this.#deleteFromActiveFileCache(taskId);
@@ -388,6 +469,39 @@ export default class TodoisterPlugin extends Plugin {
 		}
 	}
 
+	async #handleContentUpdateFromFile(file: TFile) {
+		const content = await this.app.vault.read(file);
+		const parseResults = parseContent(content);
+
+		// If there are "new" tasks (no tid), we *can* still write them back in Reading view.
+		// We'll do it by line replacement (preserving prefixes like "> " using from.ch).
+		const lines = content.split("\n");
+		let changed = false;
+
+		for (const { task, isNew, lineNumber, from } of parseResults) {
+			if (!isNew) continue;
+
+			const original = lines[lineNumber] ?? "";
+			const prefix = original.slice(0, from.ch);
+			const next = prefix + obsidianTaskStringify(task);
+
+			if (next !== original) {
+				lines[lineNumber] = next;
+				changed = true;
+			}
+		}
+
+		if (changed) {
+			await this.#vaultModifySelf(file, lines.join("\n"));
+			// Re-parse after writing IDs so cache sees correct IDs
+			const reparsed = parseContent(lines.join("\n"));
+			this.#updateActiveFileCache(reparsed);
+			return;
+		}
+
+		this.#updateActiveFileCache(parseResults, false);
+	}
+
 	#createTodoistCacheEntry(task: ObsidianTask): ActiveFileCacheItemTodoist {
 		const cacheEntry: ActiveFileCacheItemTodoist = {
 			query: queryTask({
@@ -407,7 +521,7 @@ export default class TodoisterPlugin extends Plugin {
 				todoistApi: this.#getTodoistClient,
 			}),
 		};
-
+		console.log("creating query observer for", task.id);
 		cacheEntry.query.subscribe(this.#onQueryUpdate);
 
 		return cacheEntry;
@@ -490,7 +604,7 @@ export default class TodoisterPlugin extends Plugin {
 			this.#replaceRange(editor, obsidianTaskStringify(task), from, to);
 		}
 
-		this.#updateActiveFileCache(parseResults);
+		this.#updateActiveFileCache(parseResults, true);
 	};
 
 	#onFileOpen = (file: TFile | null) => {
@@ -500,13 +614,25 @@ export default class TodoisterPlugin extends Plugin {
 	};
 
 	#onLayoutChange = () => {
-		if (!this.#pluginIsEnabled(this.app.workspace.getActiveFile())) return;
+		const file = this.app.workspace.getActiveFile();
+		console.log("[Todoister] mode:", this.#getActiveMode());
+		if (!this.#pluginIsEnabled(file)) return;
 		if (!this.#checkRequirements()) return;
 
-		this.#handleContentUpdate();
+		if (this.#isReadingView()) {
+			// preview / reading view: read+write file directly
+			this.#handleContentUpdateFromFile(file);
+		} else {
+			// source / live preview: update through editor
+			this.#handleContentUpdate();
+		}
 	};
 
 	#onEditorChange = () => {
+		// In Reading view, editor-change events can still fire / be noisy,
+		// but we don't want to push file->todoist from preview.
+		if (!this.#isEditingView()) return;
+
 		clearTimeout(this.#processContentChangeTimeout);
 
 		this.#processContentChangeTimeout = setTimeout(() => {
@@ -514,15 +640,23 @@ export default class TodoisterPlugin extends Plugin {
 			if (!this.#checkRequirements()) return;
 
 			this.#processContentChangeTimeout = undefined;
-
 			this.#handleContentUpdate();
 		}, 1000);
 	};
 
 	#invalidateAll = () => {
-		if (!this.#pluginIsEnabled(this.app.workspace.getActiveFile())) return;
+		const file = this.app.workspace.getActiveFile();
+		if (!this.#pluginIsEnabled(file)) return;
 
-		this.#queryClient.invalidateQueries();
+		const editor = this.app.workspace.activeEditor?.editor;
+		if (editor) {
+			this.#queryClient.invalidateQueries();
+		} else if (file) {
+			this.#handleContentUpdateFromFile(file).then(() => {
+				this.#queryClient.invalidateQueries();
+				this.#queryClient.refetchQueries();
+			});
+		}
 	};
 
 	#invalidateStale = () => {
@@ -531,21 +665,90 @@ export default class TodoisterPlugin extends Plugin {
 		this.#queryClient.invalidateQueries({ stale: true });
 	};
 
-	#onQueryUpdate = ({
-		data: todoistTask,
-		status,
-	}: QueryObserverResult<ObsidianTask | { deleted: true; id: string }>) => {
-		if (!this.#pluginIsEnabled(this.app.workspace.getActiveFile())) return;
-		if (!this.#checkRequirements()) return;
+	async #applyTaskUpdateToFile(
+		file: TFile,
+		updated: ObsidianTask,
+	): Promise<void> {
+		console.log("[Todoister] applyTaskUpdateToFile:", file.path, updated.id);
+		const content = await this.app.vault.read(file);
+		const parsed = parseContent(content);
 
+		const lines = content.split("\n");
+		let changed = false;
+
+		const updatedLine = obsidianTaskStringify(updated);
+
+		for (const entry of parsed) {
+			if (entry.task.id !== updated.id) continue;
+			if (tasksEquals(entry.task, updated)) continue;
+
+			const original = lines[entry.lineNumber] ?? "";
+			const prefix = original.slice(0, entry.from.ch);
+			const next = prefix + updatedLine;
+
+			if (next !== original) {
+				lines[entry.lineNumber] = next;
+				changed = true;
+			}
+		}
+
+		if (changed) {
+			await this.#vaultModifySelf(file, lines.join("\n"));
+		}
+	}
+
+	async #removeTaskFromFile(file: TFile, taskId: string): Promise<void> {
+		const content = await this.app.vault.read(file);
+		const parsed = parseContent(content)
+			.filter(({ task }) => task.id === taskId)
+			.sort((a, b) => b.lineNumber - a.lineNumber);
+
+		if (parsed.length === 0) return;
+
+		const lines = content.split("\n");
+		for (const entry of parsed) {
+			lines.splice(entry.lineNumber, 1);
+		}
+
+		await this.#vaultModifySelf(file, lines.join("\n"));
+	}
+
+	async #refreshActiveCacheFromFile(file: TFile, allowPush = false) {
+		const content = await this.app.vault.read(file);
+		const parsed = parseContent(content);
+		this.#updateActiveFileCache(parsed, allowPush);
+	}
+
+	#onQueryUpdate = async (
+		result: QueryObserverResult<ObsidianTask | { deleted: true; id: string }>,
+	) => {
+		const file = this.app.workspace.getActiveFile();
+		if (!file) return;
+
+		const { data: todoistTask, status } = result;
+
+		if (!this.#pluginIsEnabled(file)) return;
+		if (!this.#checkRequirements()) return;
 		if (!todoistTask || status !== "success") return;
 
-		const cacheEntry = this.#activeFileCache?.get(todoistTask.id);
+		const cacheEntry = this.#activeFileCache.get(todoistTask.id);
 
+		// --- Echo guard: ignore very recent local pushes (Obsidian -> Todoist -> refetch)
+		const RECENT_LOCAL_EDIT_MS = 2000;
+		const recentLocalEdit =
+			!!cacheEntry &&
+			!isObsidianCacheItem(cacheEntry) &&
+			typeof cacheEntry.lastLocalEditAt === "number" &&
+			Date.now() - cacheEntry.lastLocalEditAt < RECENT_LOCAL_EDIT_MS;
+
+		if (recentLocalEdit) return;
+
+		const editor = this.app.workspace.activeEditor?.editor;
+		const inReadingView = !editor || this.#isReadingView?.();
+
+		// --- Deleted task
 		if ("deleted" in todoistTask) {
-			const editor = this.app.workspace.activeEditor?.editor;
-
-			if (editor) {
+			if (!inReadingView && editor) {
 				const toRemove = parseContent(editor.getValue())
 					.filter(({ task }) => task.id === todoistTask.id)
 					.sort((a, b) => b.from.line - a.from.line || b.from.ch - a.from.ch);
@@ -558,19 +761,32 @@ export default class TodoisterPlugin extends Plugin {
 						{ line: from.line + 1, ch: 0 },
 					);
 				}
+			} else {
+				await this.#removeTaskFromFile(file, todoistTask.id);
+				// IMPORTANT: refresh cache from disk so switching views won't resurrect/push stale state
+				await this.#refreshActiveCacheFromFile(file, false);
 			}
 
 			this.#deleteFromActiveFileCache(todoistTask.id);
 			return;
 		}
 
-		if (cacheEntry?.updatedAt) return;
+		// --- Reading view (or no editor): write to file on disk, then refresh cache from disk
+		if (inReadingView) {
+			try {
+				await this.#applyTaskUpdateToFile(file, todoistTask);
+				await this.#refreshActiveCacheFromFile(file, false); // <-- CRITICAL
+			} catch (e) {
+				console.error("[Todoister] File update failed", e);
+				new Notice(
+					"Todoister: failed to apply Todoist update in Reading view (see console)",
+				);
+			}
+			return;
+		}
 
-		const editor = this.app.workspace.activeEditor?.editor;
-
-		if (!editor) return;
-
-		const updatedTask = obsidianTaskStringify(todoistTask);
+		// --- Live Preview / Source mode: edit via editor.replaceRange
+		const updatedTaskLine = obsidianTaskStringify(todoistTask);
 
 		const changes = parseContent(editor.getValue()).filter(
 			({ task }) =>
@@ -578,7 +794,11 @@ export default class TodoisterPlugin extends Plugin {
 		);
 
 		for (const { from, to } of changes) {
-			this.#replaceRange(editor, updatedTask, from, to);
+			this.#replaceRange(editor, updatedTaskLine, from, to);
 		}
+
+		// Optional but helpful: bring cache in sync with what we just wrote (no push)
+		// (prevents tiny timing windows where cache lags)
+		this.#updateActiveFileCache(parseContent(editor.getValue()), false);
 	};
 }
